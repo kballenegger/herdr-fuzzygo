@@ -1,0 +1,32 @@
+# herdr-plugin.toml — manifest for herdr-fuzzygo.
+#
+# A fuzzy "goto" popup for herdr: type to filter every pane in the session
+# (agents and plain shells), see their live state, and jump with Enter.
+# Replaces the built-in goto and doubles as an at-a-glance agent inbox.
+
+id = "herdr-fuzzygo"
+name = "herdr-fuzzygo"
+version = "0.1.0"
+description = "Fuzzy goto: type to jump to any pane, with live agent status for every pane."
+min_herdr_version = "0.9.0"
+platforms = ["linux", "macos"]
+
+# Recent-first ordering: the pane you came from is the top row, so
+# prefix+g, Enter flips back like alt-tab.
+[[panes]]
+id = "go"
+title = "Go to pane"
+placement = "popup"
+width = "70%"
+height = "60%"
+command = ["python3", "fuzzygo.py"]
+
+# Attention-first ordering (blocked, finished, working, idle, shells):
+# the same picker, as an inbox.
+[[panes]]
+id = "inbox"
+title = "Panes & agents"
+placement = "popup"
+width = "70%"
+height = "60%"
+command = ["/bin/sh", "-c", "FUZZYGO_MODE=inbox exec python3 fuzzygo.py"]
