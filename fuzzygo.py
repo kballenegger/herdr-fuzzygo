@@ -578,52 +578,86 @@ def read_escape(stdscr):
     return "\x1b" if not seq else None   # unknown sequence: ignore it
 
 
+# Colour roles -> (basic curses colour, theme palette key). Each role gets two
+# pairs: one on the default background and one on the selection background.
+# Never OR two colour pairs together: the pair bits add up to an undefined
+# pair, which renders black on black.
+_ROLES = (
+    ("blocked", curses.COLOR_RED, "red"),
+    ("working", curses.COLOR_YELLOW, "yellow"),
+    ("done", curses.COLOR_CYAN, "teal"),
+    ("idle", curses.COLOR_GREEN, "green"),
+    ("name", curses.COLOR_BLUE, "blue"),
+    ("ws", curses.COLOR_MAGENTA, "mauve"),
+    ("dim", curses.COLOR_WHITE, "overlay0"),
+    ("match", curses.COLOR_CYAN, "accent"),
+    ("text", -1, None),
+)
+_EXTRA = {"blocked": curses.A_BOLD, "done": curses.A_BOLD, "match": curses.A_BOLD}
+
+
+class Style:
+    """attr(role, selected) -> curses attribute with the right pair."""
+
+    def __init__(self):
+        self.pairs = {}        # (role, selected) -> pair number or None
+        self.reverse_sel = True
+        self.setup()
+
+    def setup(self):
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            return
+        pal = theme_palette()
+        full = curses.COLORS >= 256
+        sel_bg = -1
+        if full:
+            bg = pal.get("selection_bg") or pal.get("active_row_bg") or pal.get("surface0")
+            if bg:
+                sel_bg = _rgb_to_256(*bg)
+                self.reverse_sel = False
+        n = 1
+        for role, basic, key in _ROLES:
+            fg = basic
+            if full and key and key in pal:
+                fg = _rgb_to_256(*pal[key])
+            for selected in (False, True):
+                if selected and self.reverse_sel:
+                    continue
+                try:
+                    curses.init_pair(n, fg, sel_bg if selected else -1)
+                    self.pairs[(role, selected)] = n
+                except curses.error:
+                    pass
+                n += 1
+
+    def attr(self, role, selected=False):
+        role = role if any(r[0] == role for r in _ROLES) else "text"
+        if role in ("unknown", "shell"):
+            role = "dim"
+        extra = _EXTRA.get(role, 0)
+        if selected and self.reverse_sel:
+            pair = self.pairs.get((role, False))
+            return (curses.color_pair(pair) if pair else 0) | extra | curses.A_REVERSE
+        pair = self.pairs.get((role, selected))
+        if pair is None:
+            pair = self.pairs.get((role, False))
+        return (curses.color_pair(pair) if pair else 0) | extra
+
+
 def run(stdscr):
     try:
         curses.curs_set(1)
     except curses.error:
         pass
-    attrs = {
-        "blocked": curses.A_BOLD, "done": curses.A_BOLD, "working": 0,
-        "idle": 0, "unknown": curses.A_DIM, "shell": curses.A_DIM,
-        "dim": curses.A_DIM, "name": 0, "ws": 0, "match": curses.A_BOLD | curses.A_UNDERLINE,
-        "sel": curses.A_REVERSE,
-    }
-    try:
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_RED, -1)
-        curses.init_pair(2, curses.COLOR_YELLOW, -1)
-        curses.init_pair(3, curses.COLOR_CYAN, -1)
-        curses.init_pair(4, curses.COLOR_GREEN, -1)
-        curses.init_pair(5, curses.COLOR_BLUE, -1)      # agent names
-        curses.init_pair(6, curses.COLOR_MAGENTA, -1)   # workspace / tab
-        curses.init_pair(7, curses.COLOR_WHITE, -1)     # dim fallback
-        curses.init_pair(8, curses.COLOR_CYAN, -1)      # match highlight
-        pal = theme_palette()
-        if curses.COLORS >= 256:
-            for pair, key in ((1, "red"), (2, "yellow"), (3, "teal"), (4, "green"),
-                              (5, "blue"), (6, "mauve"), (7, "overlay0"),
-                              (8, "accent")):
-                if key in pal:
-                    curses.init_pair(pair, _rgb_to_256(*pal[key]), -1)
-            bg = pal.get("selection_bg") or pal.get("active_row_bg") or pal.get("surface0")
-            if bg:
-                curses.init_pair(10, -1, _rgb_to_256(*bg))
-                attrs["sel"] = curses.color_pair(10)
-        attrs.update({
-            "blocked": curses.color_pair(1) | curses.A_BOLD,
-            "done": curses.color_pair(3) | curses.A_BOLD,
-            "working": curses.color_pair(2),
-            "idle": curses.color_pair(4),
-            "unknown": curses.color_pair(7),
-            "shell": curses.color_pair(7),
-            "dim": curses.color_pair(7),
-            "name": curses.color_pair(5),
-            "ws": curses.color_pair(6),
-            "match": curses.color_pair(8) | curses.A_BOLD,
-        })
-    except curses.error:
-        pass
+    st = Style()
+
+    def A(role, selected=False):
+        if role in ("unknown", "shell"):
+            role = "dim"
+        return st.attr(role, selected)
+
     curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
     stdscr.keypad(True)
     stdscr.timeout(1000)
@@ -683,20 +717,20 @@ def run(stdscr):
         top = max(0, min(top, max(0, n - visible)))
 
         # line 0: prompt
-        x = P.seg(0, 0, " > ", attrs["match"])
+        x = P.seg(0, 0, " > ", A("match"))
         qx = P.seg(0, x, query, curses.A_BOLD)
         right = "%d/%d  %s" % (n, len(rows), mode)
-        P.seg(0, max(qx + 2, w - _ww(right) - 1), right, attrs["dim"])
+        P.seg(0, max(qx + 2, w - _ww(right) - 1), right, A("dim"))
 
         # line 1: state counts
         x = P.seg(1, 1, "", 0)
-        for st, txt in counts_summary(rows):
-            x = P.seg(1, x, txt, attrs[st])
+        for stt, txt in counts_summary(rows):
+            x = P.seg(1, x, txt, A(stt))
             x = P.seg(1, x, "  ", 0)
         if error:
-            P.seg(1, x, error, attrs["blocked"])
+            P.seg(1, x, error, A("blocked"))
         elif status_msg:
-            P.seg(1, x, status_msg, attrs["dim"])
+            P.seg(1, x, status_msg, A("dim"))
 
         # column widths for the right-hand side
         since_w = max([_ww(r["since"]) for r, _ in ranked] + [0])
@@ -708,60 +742,56 @@ def run(stdscr):
         for i in range(top, min(n, top + visible)):
             r, hl = ranked[i]
             y = list_top + (i - top)
-            selected = (i == sel)
-            base = attrs["sel"] if selected else 0
-            if selected:
-                P.seg(y, 0, " " * w, base)
-            st = r["status"]
-            x = P.seg(y, 1, ICON.get(st, "?"), attrs[st] | base)
-            x = P.seg(y, x, " ", base)
+            sel_row = (i == sel)
+            blank = A("text", sel_row)
+            if sel_row:
+                P.seg(y, 0, " " * w, blank)
+            stt = r["status"]
+            x = P.seg(y, 1, ICON.get(stt, "?"), A(stt, sel_row))
+            x = P.seg(y, x, " ", blank)
             # title (flex)
             fixed = 2 + name_w + 2 + loc_w + 2 + cwd_w + (2 + since_w if since_w else 0) + 2
             title_w = max(8, w - x - fixed)
             title = r["title"] or r["proc"] or "(shell)"
             if r["pane_id"] == focused_id:
-                title_attr = attrs["dim"]
+                title_attr = A("dim", sel_row)
             else:
-                title_attr = curses.A_BOLD if st in ("blocked", "done") else 0
-            x = P.seg_hl(y, x, _wtrunc(title, title_w), title_attr | base,
-                         attrs["match"] | base, hl.get("title"))
-            x = P.seg(y, x, " " * (title_w - min(title_w, _ww(_wtrunc(title, title_w)))), base)
-            x = P.seg(y, x, "  ", base)
+                title_attr = A("text", sel_row) | (curses.A_BOLD if stt in ("blocked", "done") else 0)
+            shown = _wtrunc(title, title_w)
+            x = P.seg_hl(y, x, shown, title_attr, A("match", sel_row), hl.get("title"))
+            x = P.seg(y, x, " " * (title_w - _ww(shown)) + "  ", blank)
             # name column: agent name, else agent kind, else process
             if r["name"]:
-                ntxt, nkey = r["name"], "name"
+                ntxt, nkey, nrole = r["name"], "name", "name"
             elif r["agent"]:
-                ntxt, nkey = r["agent"], "agent"
+                ntxt, nkey, nrole = r["agent"], "agent", "dim"
             else:
-                ntxt, nkey = r["proc"], "proc"
+                ntxt, nkey, nrole = r["proc"], "proc", "dim"
             ntxt_t = _wtrunc(ntxt, name_w)
-            x = P.seg_hl(y, x, ntxt_t, (attrs["name"] if r["name"] else attrs["dim"]) | base,
-                         attrs["match"] | base, hl.get(nkey))
-            x = P.seg(y, x, " " * (name_w - _ww(ntxt_t)) + "  ", base)
+            x = P.seg_hl(y, x, ntxt_t, A(nrole, sel_row), A("match", sel_row), hl.get(nkey))
+            x = P.seg(y, x, " " * (name_w - _ww(ntxt_t)) + "  ", blank)
             # workspace/tab
             wsl, tbl = r["ws_label"], r["tab_label"]
             loc = _wtrunc("%s/%s" % (wsl, tbl), loc_w)
             ws_pos = hl.get("ws_label") or set()
             tb_pos = {len(wsl) + 1 + p for p in (hl.get("tab_label") or set())}
-            x = P.seg_hl(y, x, loc, attrs["ws"] | base, attrs["match"] | base,
-                         ws_pos | tb_pos)
-            x = P.seg(y, x, " " * (loc_w - _ww(loc)) + "  ", base)
+            x = P.seg_hl(y, x, loc, A("ws", sel_row), A("match", sel_row), ws_pos | tb_pos)
+            x = P.seg(y, x, " " * (loc_w - _ww(loc)) + "  ", blank)
             # cwd
             cwd = _wtrunc(r["short_cwd"], cwd_w)
-            x = P.seg_hl(y, x, cwd, attrs["dim"] | base, attrs["match"] | base,
-                         hl.get("short_cwd"))
-            x = P.seg(y, x, " " * (cwd_w - _ww(cwd)), base)
+            x = P.seg_hl(y, x, cwd, A("dim", sel_row), A("match", sel_row), hl.get("short_cwd"))
+            x = P.seg(y, x, " " * (cwd_w - _ww(cwd)), blank)
             # since
             if since_w:
-                x = P.seg(y, x, "  ", base)
-                x = P.seg(y, x, _pad(r["since"], since_w), attrs["dim"] | base)
+                x = P.seg(y, x, "  ", blank)
+                x = P.seg(y, x, _pad(r["since"], since_w), A("dim", sel_row))
             if r["pane_id"] == focused_id:
-                P.seg(y, x, " ◂", attrs["dim"] | base)
+                P.seg(y, x, " ◂", A("dim", sel_row))
 
         # footer
         help_line = (" enter:jump  tab:%s  ctrl+u:clear  esc:close" %
                      ("inbox order" if mode == "go" else "recent order"))
-        P.seg(h - 1, 0, _wtrunc(help_line, w - 1), attrs["dim"])
+        P.seg(h - 1, 0, _wtrunc(help_line, w - 1), A("dim"))
         try:
             stdscr.move(0, min(qx, w - 1))
         except curses.error:

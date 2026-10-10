@@ -31,7 +31,11 @@ the harness used: fork a pty, set 120x30, write keys, read `FUZZYGO_DRY_RUN`).
 - Rendering goes through `Painter.seg/seg_hl` — display-width aware
   (`_wtrunc`), never past the window edge. Colours follow herdr's sidebar
   language (blocked red, working yellow, done teal, idle green, shells dim)
-  via `theme_palette()`.
+  via `theme_palette()`, resolved by `Style.attr(role, selected)`, which
+  keeps one pair per role on the default background and one on the
+  selection background. Never OR two `color_pair()` values together: the
+  pair bits add up to an undefined pair that renders black on black (this
+  was the "right columns invisible on the selected row" bug in 0.1.0).
 - `focus_pane()` uses `pane.focus`, verifies `focused`, and walks
   workspace → tab → pane if needed. `herdr_request` raises only
   `RuntimeError`/`OSError`; keep it that way.
