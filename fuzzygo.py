@@ -2,7 +2,9 @@
 """herdr-fuzzygo — fuzzy goto popup for herdr.
 
 Type to fuzzy-filter every pane in the session (agents and plain shells
-alike), see each one's live state, and jump to it with Enter.
+alike), see each one's live state, and jump to it with Enter. Panes on
+enabled saved SSH machines (`herdr machine list`) are listed too, prefixed
+with the machine label.
 
 Keys:
   type           filter (smart case, space-separated terms all must match)
@@ -16,8 +18,10 @@ Keys:
 
 Environment:
   FUZZYGO_MODE=go|inbox   initial ordering (default go)
-  FUZZYGO_DRY_RUN=<path>  write the chosen pane id to <path> instead of focusing
+  FUZZYGO_DRY_RUN=<path>  write the chosen pane key to <path> instead of focusing
+                          (pane id, or <machine id>/<pane id> on a saved machine)
   HERDR_SOCKET_PATH       herdr session socket (set by herdr in managed panes)
+  HERDR_BIN_PATH          herdr binary, for `--machine` forwarding (default: herdr)
 
 CLI:
   python3 fuzzygo.py                open the popup
@@ -29,6 +33,7 @@ import curses
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import unicodedata
@@ -81,6 +86,56 @@ def herdr_request(method, params=None, timeout=4.0):
     return resp.get("result") or {}
 
 
+# Saved SSH machines live behind their own herdr servers; the socket API only
+# reaches the one we run in. The CLI forwards `--machine <id> ...` over SSH.
+HERDR_BIN = os.environ.get("HERDR_BIN_PATH") or "herdr"
+
+
+def herdr_cli(args, timeout=8.0):
+    """Run `herdr <args>` and return its parsed JSON. Raises only RuntimeError/OSError."""
+    try:
+        p = subprocess.run([HERDR_BIN] + list(args), capture_output=True,
+                           text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("timed out after %gs" % timeout)
+    out = p.stdout.strip()
+    if not out:
+        err = (p.stderr.strip().splitlines() or ["no output"])[-1]
+        raise RuntimeError(err[:160])
+    try:
+        resp = json.loads(out)                      # one document (may be pretty-printed)
+    except ValueError:
+        try:
+            resp = json.loads(out.splitlines()[-1])  # a JSON line after chatter
+        except ValueError as e:
+            raise RuntimeError("bad CLI output: %s" % e)
+    if isinstance(resp, dict) and "error" in resp:
+        err = resp["error"]
+        raise RuntimeError(err.get("message") if isinstance(err, dict) else str(err))
+    return resp
+
+
+def _cli_result(args, timeout=8.0):
+    resp = herdr_cli(args, timeout)
+    return (resp.get("result") or {}) if isinstance(resp, dict) else {}
+
+
+def list_machines():
+    """Enabled saved SSH machines: [{"id", "label", "selected"}]. [] when none.
+
+    `selected` is the machine the herdr client is viewing (none: Local)."""
+    try:
+        v = herdr_cli(["machine", "list", "--json"], timeout=5.0)
+    except (OSError, RuntimeError):
+        return []
+    if not isinstance(v, list):
+        return []
+    return [{"id": m["id"],
+             "label": m.get("label") or m.get("target") or m["id"],
+             "selected": bool(m.get("selected"))}
+            for m in v if isinstance(m, dict) and m.get("enabled") and m.get("id")]
+
+
 # -------------------------------------------------------------------- rows
 
 # Attention tiers, matching herdr's sidebar language.
@@ -104,18 +159,26 @@ def _short_cwd(cwd):
     return "/".join(head + parts[-2:])
 
 
+DEMO_MACHINES = [{"id": "demo-klaw", "label": "klaw", "selected": False}]
+
+
 def _demo_rows():
     def mk(i, ws, wsl, tab, tabl, cwd, agent, name, status, title, since,
-           focused=False, proc=""):
+           focused=False, proc="", machine=None):
+        pid = "%s:p%d" % (ws, i)
+        mid = machine["id"] if machine else ""
         return {
-            "pane_id": "%s:p%d" % (ws, i), "tab_id": "%s:%s" % (ws, tab),
+            "pane_id": pid, "tab_id": "%s:%s" % (ws, tab),
             "terminal_id": "t%d" % i, "workspace_id": ws, "ws_label": wsl,
             "ws_number": int(ws[1:]), "tab_label": tabl, "tab_number": 1,
             "agent": agent, "name": name, "status": status, "title": title,
             "cwd": cwd, "short_cwd": _short_cwd(cwd), "proc": proc,
             "age": since, "since": since, "flag": "", "focused": focused,
-            "seq": 100 - i,
+            "seq": 100 - i, "machine": machine["label"] if machine else "",
+            "machine_id": mid, "key": "%s/%s" % (mid, pid) if mid else pid,
+            "zoomed": False,
         }
+    klaw = DEMO_MACHINES[0]
     return [
         mk(1, "w1", "webapp", "t1", "1", "/Users/dev/webapp", "claude", "oauth",
            "blocked", "Add OAuth login flow with refresh tokens", "12m"),
@@ -134,13 +197,24 @@ def _demo_rows():
            "", "", proc="tail"),
         mk(8, "w4", "blog", "t1", "1", "/Users/dev/blog", None, "", "shell",
            "", "", proc="nvim"),
+        mk(1, "w1", "kenneth-bot", "t1", "operations", "/Users/bot", "claude",
+           "", "idle", "klaw", "3h", machine=klaw),
+        mk(3, "w1", "kenneth-bot", "t1", "operations", "/Users/bot/klaw-mcp",
+           "claude", "", "working", "Cswap keychain cleanup", "4m", machine=klaw),
+        mk(2, "w1", "kenneth-bot", "t1", "operations", "/Users/bot/klaw-mcp",
+           None, "", "shell", "", "", proc="zsh", machine=klaw),
     ]
 
 
-def _process_name(pane_id):
+def _process_name(pane_id, machine_id=""):
     try:
-        info = herdr_request("pane.process_info", {"pane_id": pane_id},
-                             timeout=1.5).get("process_info") or {}
+        if machine_id:
+            info = _cli_result(["--machine", machine_id, "pane", "process-info",
+                                "--pane", pane_id], timeout=6.0)
+        else:
+            info = herdr_request("pane.process_info", {"pane_id": pane_id},
+                                 timeout=1.5)
+        info = info.get("process_info") or {}
     except (OSError, RuntimeError):
         return "", []
     procs = info.get("foreground_processes") or []
@@ -151,31 +225,9 @@ def _process_name(pane_id):
     return os.path.basename(name).lstrip("-"), p.get("argv") or []
 
 
-def load_rows():
-    """All panes in the session, merged with agent names and labels."""
-    if DEMO:
-        return _demo_rows()
-    panes = herdr_request("pane.list", {}).get("panes") or []
-    ws_info = {}
-    try:
-        for ws in herdr_request("workspace.list", {}).get("workspaces") or []:
-            ws_info[ws.get("workspace_id")] = ws
-    except (OSError, RuntimeError):
-        pass
-    agents = {}
-    try:
-        for a in herdr_request("agent.list", {}).get("agents") or []:
-            agents[a.get("pane_id")] = a
-    except (OSError, RuntimeError):
-        pass
-    tabs = {}
-    for ws_id in ws_info:
-        try:
-            for t in herdr_request("tab.list", {"workspace_id": ws_id}).get("tabs") or []:
-                tabs[t.get("tab_id")] = t
-        except (OSError, RuntimeError):
-            pass
-
+def _build_rows(panes, ws_info, tabs, agents, machine=None, zoomed_tabs=()):
+    """Rows for one server. `machine` is None for the server we run in."""
+    mid = machine["id"] if machine else ""
     rows = []
     for p in panes:
         ws = ws_info.get(p.get("workspace_id")) or {}
@@ -189,8 +241,9 @@ def load_rows():
         title = (p.get("title") or tokens.get("title")
                  or p.get("terminal_title_stripped") or "")
         cwd = p.get("foreground_cwd") or p.get("cwd") or ""
+        pid = p.get("pane_id")
         rows.append({
-            "pane_id": p.get("pane_id"),
+            "pane_id": pid,
             "tab_id": p.get("tab_id"),
             "terminal_id": p.get("terminal_id"),
             "workspace_id": p.get("workspace_id"),
@@ -211,22 +264,144 @@ def load_rows():
             "flag": tokens.get("flag") or "",
             "focused": bool(p.get("focused")),
             "seq": ag.get("state_change_seq") or 0,
+            # machine label/id ("" here), and the identity used for MRU,
+            # selection and dry runs: pane id, or "<machine id>/<pane id>"
+            "machine": machine["label"] if machine else "",
+            "machine_id": mid,
+            "key": "%s/%s" % (mid, pid) if mid else pid,
+            "zoomed": p.get("tab_id") in zoomed_tabs,
         })
+    return rows
 
-    # Foreground process names for plain shells (and drop our own popup).
+
+def _finish_rows(rows):
+    """Foreground process names for plain shells; drop our own popup pane."""
     shells = [r for r in rows if not r["agent"]]
     if shells:
         with ThreadPoolExecutor(max_workers=8) as ex:
             for r, (name, argv) in zip(shells, ex.map(
-                    lambda r: _process_name(r["pane_id"]), shells)):
+                    lambda r: _process_name(r["pane_id"], r["machine_id"]), shells)):
                 r["proc"] = name
-                if any(a.endswith("fuzzygo.py") for a in argv):
+                if not r["machine_id"] and any(a.endswith("fuzzygo.py") for a in argv):
                     r["self"] = True
     rows = [r for r in rows if not r.get("self")]
     for r in rows:
         if not r["title"]:
-            r["title"] = r["label"] or r["proc"] or ""
+            r["title"] = r["label"] or r["proc"] or r["agent"] or ""
     return rows
+
+
+def load_local_rows():
+    """Panes of the server we run in, merged with agent names and labels."""
+    panes = herdr_request("pane.list", {}).get("panes") or []
+    ws_info = {}
+    try:
+        for ws in herdr_request("workspace.list", {}).get("workspaces") or []:
+            ws_info[ws.get("workspace_id")] = ws
+    except (OSError, RuntimeError):
+        pass
+    agents = {}
+    try:
+        for a in herdr_request("agent.list", {}).get("agents") or []:
+            agents[a.get("pane_id")] = a
+    except (OSError, RuntimeError):
+        pass
+    tabs = {}
+    for ws_id in ws_info:
+        try:
+            for t in herdr_request("tab.list", {"workspace_id": ws_id}).get("tabs") or []:
+                tabs[t.get("tab_id")] = t
+        except (OSError, RuntimeError):
+            pass
+    return _finish_rows(_build_rows(panes, ws_info, tabs, agents))
+
+
+def load_machine_rows(machine):
+    """Panes of one saved SSH machine, from a single forwarded snapshot."""
+    snap = _cli_result(["--machine", machine["id"], "api", "snapshot"],
+                       timeout=10.0).get("snapshot") or {}
+    ws_info = {w.get("workspace_id"): w for w in snap.get("workspaces") or []}
+    tabs = {t.get("tab_id"): t for t in snap.get("tabs") or []}
+    agents = {a.get("pane_id"): a for a in snap.get("agents") or []}
+    zoomed = {l.get("tab_id") for l in snap.get("layouts") or [] if l.get("zoomed")}
+    return _finish_rows(_build_rows(snap.get("panes") or [], ws_info, tabs,
+                                    agents, machine, zoomed))
+
+
+REMOTE_REFRESH = 4.0   # seconds between saved-machine refreshes
+
+
+class Remote:
+    """Rows from saved SSH machines, refreshed on a worker thread.
+
+    Listing a machine costs SSH round trips (a snapshot, then process info
+    per shell), so the popup paints local rows at once and remote rows join
+    when they arrive, then refresh every REMOTE_REFRESH seconds."""
+
+    def __init__(self):
+        self.pool = ThreadPoolExecutor(max_workers=1)
+        self.future = None
+        self.at = 0.0
+        self.machines = None     # None until listed once
+        self.rows = []
+        self.errors = {}         # machine label -> message
+
+    @staticmethod
+    def _one(m):
+        try:
+            return load_machine_rows(m)
+        except (OSError, RuntimeError) as e:
+            return e
+
+    def _fetch(self):
+        machines = list_machines()
+        rows, errors = [], {}
+        if machines:
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                for m, res in zip(machines, ex.map(self._one, machines)):
+                    if isinstance(res, Exception):
+                        errors[m["label"]] = str(res)
+                    else:
+                        rows.extend(res)
+        return machines, rows, errors
+
+    def pending(self):
+        return self.future is not None and self.at == 0.0
+
+    def poll(self, wait=False):
+        """(machines, rows, errors); starts a refresh when the last is stale."""
+        if self.machines is None:
+            self.machines = list_machines()      # local and cheap; seeds `selected`
+        if self.future is None and time.time() - self.at >= REMOTE_REFRESH:
+            self.future = self.pool.submit(self._fetch)
+        if self.future is not None and (wait or self.future.done()):
+            try:
+                self.machines, self.rows, self.errors = self.future.result()
+            except Exception as e:                      # worker bug: show, don't crash
+                self.errors = {"saved machines": str(e)}
+            self.future = None
+            self.at = time.time()
+        return self.machines, self.rows, self.errors
+
+
+REMOTE = Remote()
+
+
+def load_rows(wait=False):
+    """All panes: this server's plus every enabled saved SSH machine's.
+
+    Returns (rows, machines, errors). Remote rows lag behind local ones
+    unless `wait` (see Remote)."""
+    if DEMO:
+        return _demo_rows(), list(DEMO_MACHINES), {}
+    rows = load_local_rows()
+    machines, remote_rows, errors = REMOTE.poll(wait)
+    return rows + remote_rows, machines, errors
+
+
+def selected_machine(machines):
+    """Id of the machine the herdr client is viewing ("" for Local)."""
+    return next((m["id"] for m in machines if m.get("selected")), "")
 
 
 # --------------------------------------------------------------------- MRU
@@ -317,8 +492,8 @@ def fuzzy(term, text, case_sensitive):
 
 # Fields searched, with weights; highlights are keyed by field name.
 FIELDS = (("name", 1.3), ("title", 1.15), ("ws_label", 1.1), ("tab_label", 1.0),
-          ("proc", 1.0), ("short_cwd", 0.85), ("agent", 0.9), ("pane_id", 0.9),
-          ("status", 0.8))
+          ("machine", 1.0), ("proc", 1.0), ("short_cwd", 0.85), ("agent", 0.9),
+          ("pane_id", 0.9), ("status", 0.8))
 
 
 def match_row(row, terms, case_sensitive):
@@ -347,19 +522,19 @@ def match_row(row, terms, case_sensitive):
 def base_order(rows, mode, mru, focused_id):
     """Order with an empty query. Returns list of rows."""
     def tier_key(r):
-        return (TIER.get(r["status"], 4), -r["seq"], r["ws_number"],
-                r["tab_number"], r["pane_id"])
+        return (TIER.get(r["status"], 4), -r["seq"], r["machine"],
+                r["ws_number"], r["tab_number"], r["pane_id"])
     rest = sorted(rows, key=tier_key)
     if mode == "go":
-        pos = {pid: i for i, pid in enumerate(mru)}
-        recent = sorted([r for r in rest if r["pane_id"] in pos and
-                         r["pane_id"] != focused_id],
-                        key=lambda r: pos[r["pane_id"]])
-        seen = {r["pane_id"] for r in recent}
-        rest = recent + [r for r in rest if r["pane_id"] not in seen]
+        pos = {k: i for i, k in enumerate(mru)}
+        recent = sorted([r for r in rest if r["key"] in pos and
+                         r["key"] != focused_id],
+                        key=lambda r: pos[r["key"]])
+        seen = {r["key"] for r in recent}
+        rest = recent + [r for r in rest if r["key"] not in seen]
     # the pane you are already in goes last — Enter on the top row always moves
-    return ([r for r in rest if r["pane_id"] != focused_id]
-            + [r for r in rest if r["pane_id"] == focused_id])
+    return ([r for r in rest if r["key"] != focused_id]
+            + [r for r in rest if r["key"] == focused_id])
 
 
 def rank(rows, query, mode, mru, focused_id):
@@ -381,25 +556,62 @@ def rank(rows, query, mode, mru, focused_id):
 # ------------------------------------------------------------------- focus
 
 
-def focus_pane(row):
+def _focus_local(row):
+    pid = row["pane_id"]
+    res = herdr_request("pane.focus", {"pane_id": pid})
+    if (res.get("pane") or {}).get("focused"):
+        return
+    # belt and braces: walk the hierarchy if a bare pane.focus did not land
+    herdr_request("workspace.focus", {"workspace_id": row["workspace_id"]})
+    herdr_request("tab.focus", {"tab_id": row["tab_id"]})
+    herdr_request("pane.focus", {"pane_id": pid})
+
+
+def _focus_remote(row):
+    m = ["--machine", row["machine_id"]]
+    if row["agent"]:
+        _cli_result(m + ["agent", "focus", row["pane_id"]])
+        return
+    # No forwarded CLI command focuses a plain pane by id (`pane focus` is
+    # directional), so land in its workspace and tab, then zoom it: zoom moves
+    # focus to the pane. Zoom back off unless the tab was zoomed already.
+    _cli_result(m + ["workspace", "focus", row["workspace_id"]])
+    _cli_result(m + ["tab", "focus", row["tab_id"]])
+    _cli_result(m + ["pane", "zoom", row["pane_id"], "--on"])
+    if not row.get("zoomed"):
+        _cli_result(m + ["pane", "zoom", row["pane_id"], "--off"])
+
+
+def focus_pane(row, current_machine=""):
+    """Focus the pane on its server. `current_machine` is the machine the
+    herdr client is viewing ("" for Local); herdr offers no API to switch the
+    client's machine, so when they differ the pane is focused where it lives
+    and a toast tells the user to pick that machine in the sidebar."""
     dry = os.environ.get("FUZZYGO_DRY_RUN")
     if dry:
         with open(dry, "w") as f:
-            f.write(row["pane_id"] + "\n")
+            f.write(row["key"] + "\n")
         return None
     if DEMO:
         return None
-    pid = row["pane_id"]
     try:
-        res = herdr_request("pane.focus", {"pane_id": pid})
-        if (res.get("pane") or {}).get("focused"):
-            return None
-        # belt and braces: walk the hierarchy if a bare pane.focus did not land
-        herdr_request("workspace.focus", {"workspace_id": row["workspace_id"]})
-        herdr_request("tab.focus", {"tab_id": row["tab_id"]})
-        herdr_request("pane.focus", {"pane_id": pid})
+        if row["machine_id"]:
+            _focus_remote(row)
+        else:
+            _focus_local(row)
     except (OSError, RuntimeError) as e:
         return "focus failed: %s" % e
+    if row["machine_id"] != current_machine:
+        target = row["machine"] or "Local"
+        try:
+            herdr_request("notification.show", {
+                "title": "Switch to %s in the sidebar" % target,
+                "body": "%s is focused on %s. Click the machine or use "
+                        "prefix+w; plugins cannot switch machines." % (
+                            _wtrunc(row["title"] or row["proc"] or row["pane_id"], 40),
+                            target)})
+        except (OSError, RuntimeError):
+            pass
     return None
 
 
@@ -525,6 +737,12 @@ class Painter:
                 pass
             cx += _cw(ch)
         return cx
+
+
+def _loc(r):
+    """Location column: workspace/tab, prefixed by the machine label if remote."""
+    loc = "%s/%s" % (r["ws_label"], r["tab_label"])
+    return "%s:%s" % (r["machine"], loc) if r["machine"] else loc
 
 
 def counts_summary(rows):
@@ -672,22 +890,26 @@ def run(stdscr):
     status_msg = ""
     error = ""
     rows = []
+    machines = []
+    remote_errors = {}
+    current = ""          # machine the client is viewing ("" = Local)
     mru = load_mru()
     focused_id = None
     last_load = 0.0
     last_click = (0.0, -1)
 
     def reload():
-        nonlocal rows, error, last_load, focused_id, mru
+        nonlocal rows, machines, remote_errors, current, error, last_load, focused_id, mru
         try:
-            rows = load_rows()
+            rows, machines, remote_errors = load_rows()
             error = ""
         except (OSError, RuntimeError) as e:
             error = "herdr unreachable: %s" % e
         last_load = time.time()
-        f = [r for r in rows if r["focused"]]
+        current = selected_machine(machines)
+        f = [r for r in rows if r["focused"] and r["machine_id"] == current]
         if f and focused_id is None:
-            focused_id = f[0]["pane_id"]
+            focused_id = f[0]["key"]
             mru = mru_touch(mru, focused_id)
             save_mru(mru)
 
@@ -699,11 +921,11 @@ def run(stdscr):
         # keep the selection on the same pane while rows move underneath
         if sel_pid is not None:
             for i, (r, _) in enumerate(ranked):
-                if r["pane_id"] == sel_pid:
+                if r["key"] == sel_pid:
                     sel = i
                     break
         sel = max(0, min(sel, n - 1)) if n else 0
-        sel_pid = ranked[sel][0]["pane_id"] if n else None
+        sel_pid = ranked[sel][0]["key"] if n else None
 
         h, w = stdscr.getmaxyx()
         P = Painter(stdscr, w)
@@ -731,12 +953,17 @@ def run(stdscr):
             P.seg(1, x, error, A("blocked"))
         elif status_msg:
             P.seg(1, x, status_msg, A("dim"))
+        elif remote_errors:
+            P.seg(1, x, "; ".join("%s: %s" % kv for kv in sorted(remote_errors.items())),
+                  A("dim"))
+        elif machines and not DEMO and REMOTE.pending():
+            P.seg(1, x, "loading %s…" % ", ".join(m["label"] for m in machines), A("dim"))
 
         # column widths for the right-hand side
         since_w = max([_ww(r["since"]) for r, _ in ranked] + [0])
         since_w = min(since_w, 8)
         cwd_w = min(max([_ww(r["short_cwd"]) for r, _ in ranked] + [0]), max(12, w // 4))
-        loc_w = min(max([_ww("%s/%s" % (r["ws_label"], r["tab_label"])) for r, _ in ranked] + [0]), max(10, w // 5))
+        loc_w = min(max([_ww(_loc(r)) for r, _ in ranked] + [0]), max(10, w // 5))
         name_w = min(max([_ww(r["name"] or r["agent"] or r["proc"] or "") for r, _ in ranked] + [0]), 16)
 
         for i in range(top, min(n, top + visible)):
@@ -753,7 +980,7 @@ def run(stdscr):
             fixed = 2 + name_w + 2 + loc_w + 2 + cwd_w + (2 + since_w if since_w else 0) + 2
             title_w = max(8, w - x - fixed)
             title = r["title"] or r["proc"] or "(shell)"
-            if r["pane_id"] == focused_id:
+            if r["key"] == focused_id:
                 title_attr = A("dim", sel_row)
             else:
                 title_attr = A("text", sel_row) | (curses.A_BOLD if stt in ("blocked", "done") else 0)
@@ -770,12 +997,16 @@ def run(stdscr):
             ntxt_t = _wtrunc(ntxt, name_w)
             x = P.seg_hl(y, x, ntxt_t, A(nrole, sel_row), A("match", sel_row), hl.get(nkey))
             x = P.seg(y, x, " " * (name_w - _ww(ntxt_t)) + "  ", blank)
-            # workspace/tab
+            # [machine:]workspace/tab
             wsl, tbl = r["ws_label"], r["tab_label"]
-            loc = _wtrunc("%s/%s" % (wsl, tbl), loc_w)
-            ws_pos = hl.get("ws_label") or set()
-            tb_pos = {len(wsl) + 1 + p for p in (hl.get("tab_label") or set())}
-            x = P.seg_hl(y, x, loc, A("ws", sel_row), A("match", sel_row), ws_pos | tb_pos)
+            loc = _wtrunc(_loc(r), loc_w)
+            off = len(r["machine"]) + 1 if r["machine"] else 0
+            m_pos = set(hl.get("machine") or ())
+            ws_pos = {off + p for p in (hl.get("ws_label") or set())}
+            tb_pos = {off + len(wsl) + 1 + p for p in (hl.get("tab_label") or set())}
+            x = P.seg_hl(y, x, loc[:off], A("name", sel_row), A("match", sel_row), m_pos)
+            x = P.seg_hl(y, x, loc[off:], A("ws", sel_row), A("match", sel_row),
+                         {p - off for p in ws_pos | tb_pos})
             x = P.seg(y, x, " " * (loc_w - _ww(loc)) + "  ", blank)
             # cwd
             cwd = _wtrunc(r["short_cwd"], cwd_w)
@@ -785,7 +1016,7 @@ def run(stdscr):
             if since_w:
                 x = P.seg(y, x, "  ", blank)
                 x = P.seg(y, x, _pad(r["since"], since_w), A("dim", sel_row))
-            if r["pane_id"] == focused_id:
+            if r["key"] == focused_id:
                 P.seg(y, x, " ◂", A("dim", sel_row))
 
         # footer
@@ -815,11 +1046,11 @@ def run(stdscr):
             if not n or idx >= n:
                 return False
             row = ranked[idx][0]
-            err = focus_pane(row)
+            err = focus_pane(row, current)
             if err:
                 status_msg = err
                 return False
-            mru = mru_touch(mru, row["pane_id"])
+            mru = mru_touch(mru, row["key"])
             save_mru(mru)
             return True
 
@@ -837,7 +1068,7 @@ def run(stdscr):
                         last_click[1] == idx and now - last_click[0] < 0.4)
                     last_click = (now, idx)
                     sel = idx
-                    sel_pid = ranked[idx][0]["pane_id"]
+                    sel_pid = ranked[idx][0]["key"]
                     if double and jump(idx):
                         return
             continue
@@ -902,17 +1133,21 @@ def run(stdscr):
 
 
 def dump(query):
-    rows = load_rows()
+    rows, machines, errors = load_rows(wait=True)
+    for label, msg in sorted(errors.items()):
+        print("# %s: %s" % (label, msg), file=sys.stderr)
     mode = os.environ.get("FUZZYGO_MODE", "go")
-    focused = next((r["pane_id"] for r in rows if r["focused"]), None)
+    current = selected_machine(machines)
+    focused = next((r["key"] for r in rows if r["focused"] and r["machine_id"] == current), None)
     for r, hl in rank(rows, query, mode if mode in MODES else "go", load_mru(), focused):
-        print("%s %-8s %-7s %-40s %-14s %-18s %-30s %s%s" % (
-            ICON[r["status"]], r["pane_id"], r["status"],
+        shown_id = "%s/%s" % (r["machine"], r["pane_id"]) if r["machine"] else r["pane_id"]
+        print("%s %-12s %-7s %-40s %-14s %-24s %-30s %s%s" % (
+            ICON[r["status"]], shown_id, r["status"],
             _wtrunc(r["title"] or r["proc"], 40),
             r["name"] or r["agent"] or r["proc"],
-            _wtrunc("%s/%s" % (r["ws_label"], r["tab_label"]), 18),
+            _wtrunc(_loc(r), 24),
             _wtrunc(r["short_cwd"], 30), r["since"],
-            "  ◂" if r["pane_id"] == focused else ""))
+            "  ◂" if r["key"] == focused else ""))
 
 
 def main():

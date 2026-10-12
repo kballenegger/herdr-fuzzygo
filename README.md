@@ -35,8 +35,12 @@ Two orderings, toggled with `tab`:
   working, idle, shells. The pane you are already in always sorts last, so
   Enter on the top row always moves you somewhere.
 
-Stdlib Python only. Talks to herdr through its public socket API and plugin
-manifest; nothing is patched.
+Panes on your saved SSH machines (`herdr machine list`) are in the list too,
+prefixed with the machine label (`klaw:kenneth-bot/operations`), searchable
+by that label, refreshed every few seconds. See [Other machines](#other-machines).
+
+Stdlib Python only. Talks to herdr through its public socket API, CLI and
+plugin manifest; nothing is patched.
 
 ## Keys
 
@@ -97,13 +101,41 @@ characters are highlighted.
 
 The recent-jump list lives in `<herdr config dir>/fuzzygo-state/mru.json`.
 
+### Other machines
+
+herdr's socket only reaches the server the popup runs in, so enabled saved
+SSH machines are listed through the CLI's forwarding: one
+`herdr --machine <id> api snapshot` per machine (plus `pane process-info`
+per plain shell) on a worker thread, so the local rows paint at once and the
+remote ones join a few hundred milliseconds later. Unreachable machines show
+a dim note on the status line instead of blocking the popup.
+
+Enter on a remote row focuses the pane on its own server: `agent focus` for
+agent panes; for plain shells `workspace focus`, `tab focus`, then
+`pane zoom --on` (which moves focus to the pane) and `--off` again, because
+no forwarded command focuses a pane by id. One limit herdr imposes: a plugin
+cannot switch which machine the herdr *client* is looking at — only the
+sidebar, the workspace picker (`prefix+w`) and notification targets do that.
+So when the pane lives on a machine other than the one you are viewing, the
+popup focuses it there and shows a toast asking you to pick that machine in
+the sidebar; it is then the focused pane when you arrive.
+
+The MRU list keys remote panes as `<machine id>/<pane id>`; local panes keep
+their bare id.
+
 ### Developing
 
 ```sh
 python3 fuzzygo.py --demo              # popup with canned data, no herdr
 python3 fuzzygo.py --dump [query]      # print the ranked rows for a query
 herdr plugin link "$PWD"               # register this checkout with a live herdr
-FUZZYGO_DRY_RUN=/tmp/choice python3 fuzzygo.py   # Enter writes the pane id instead of focusing
+FUZZYGO_DRY_RUN=/tmp/choice python3 fuzzygo.py   # Enter writes the pane key instead of focusing
+```
+
+`--dump` waits for the saved machines and prints their panes as
+`<label>/<pane id>`; machine errors go to stderr as `# <label>: <error>`.
+
+```sh
 ```
 
 ## License
