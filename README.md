@@ -118,7 +118,11 @@ cannot switch which machine the herdr *client* is looking at — only the
 sidebar, the workspace picker (`prefix+w`) and notification targets do that.
 So when the pane lives on a machine other than the one you are viewing, the
 popup focuses it there and shows a toast asking you to pick that machine in
-the sidebar; it is then the focused pane when you arrive.
+the sidebar; it is then the focused pane when you arrive. The missing API is
+requested upstream in herdr discussions
+[#3749](https://github.com/herdrdev/herdr/discussions/3749) and
+[#4007](https://github.com/herdrdev/herdr/discussions/4007); once herdr
+honours a machine-qualified focus, Enter will land there in one step.
 
 The MRU list keys remote panes as `<machine id>/<pane id>`; local panes keep
 their bare id.
