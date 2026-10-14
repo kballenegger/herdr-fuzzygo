@@ -8,7 +8,7 @@
 
 id = "herdr-fuzzygo"
 name = "herdr-fuzzygo"
-version = "0.2.0"
+version = "0.2.1"
 description = "Fuzzy goto: type to jump to any pane, with live agent status for every pane."
 min_herdr_version = "0.9.0"
 platforms = ["linux", "macos"]

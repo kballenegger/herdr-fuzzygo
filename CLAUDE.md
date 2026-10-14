@@ -41,6 +41,17 @@ the harness used: fork a pty, set 120x30, write keys, read `FUZZYGO_DRY_RUN`).
   need `workspace focus` + `tab focus` + `pane zoom --on` (zoom moves focus)
   then `--off` unless the tab was zoomed, since the forwarded `pane focus`
   is directional only.
+- A key binding is executed by the server the client is viewing, and
+  plugins are per server (`src/client/shell/actions.rs` resolves the command
+  from the endpoint's published list, then `command.invoke` runs there). So
+  the plugin must be installed, with the bindings in that machine's
+  `config.toml`, on every machine Kenneth views; klaw has it via
+  `herdr plugin install kballenegger/herdr-fuzzygo --yes` run over ssh in a
+  login shell (`--machine` refuses management commands). The server's PATH
+  is launchd's minimal one on macOS, so `python3` there is the system 3.9:
+  keep the code 3.9-clean (`/usr/bin/python3 -m py_compile`), and
+  `theme_palette()` falls back to `_theme_from_toml_lines()` without
+  `tomllib`.
 - `rank()` = `base_order()` (go: MRU then tiers; inbox: tiers; focused pane
   last) filtered and scored by `match_row()` → `fuzzy()` per field with
   `FIELDS` weights. Highlights are per field, keyed by field name.

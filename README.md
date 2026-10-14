@@ -56,11 +56,18 @@ plugin manifest; nothing is patched.
 
 ## Install
 
-Requires herdr ≥ 0.9 and `python3` (3.11+ for theme colours) on PATH.
+Requires herdr ≥ 0.9 and `python3` (3.9+) on PATH.
 
 ```sh
 herdr plugin install kballenegger/herdr-fuzzygo
 ```
+
+Install it on **every machine you view through herdr**, with the key
+bindings below in each machine's `config.toml`. A key binding runs on the
+server the client is currently looking at, and herdr plugins live per
+server, so a plugin that is only installed locally does nothing while you
+are viewing a saved SSH machine (the key either falls through or herdr
+reports "custom command is not available on this endpoint").
 
 Then in `~/.config/herdr/config.toml` unbind the built-in goto and point
 `prefix+g` / `prefix+i` at the plugin:
@@ -126,6 +133,13 @@ honours a machine-qualified focus, Enter will land there in one step.
 
 The MRU list keys remote panes as `<machine id>/<pane id>`; local panes keep
 their bare id.
+
+The popup itself always runs on the machine you are viewing, so it must be
+installed there (see Install). On a remote machine it lists that server's
+panes plus whatever machines *that* server has saved. The herdr server does
+not carry your login shell's PATH (a launchd-started server on macOS sees
+only `/usr/bin:/bin:/usr/sbin:/sbin`), so `python3` is usually the system
+one; the plugin runs on 3.9 and reads the theme without `tomllib` there.
 
 ### Developing
 

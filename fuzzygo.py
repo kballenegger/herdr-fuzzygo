@@ -32,6 +32,7 @@ CLI:
 import curses
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -640,17 +641,48 @@ _PALETTES = {
 }
 
 
+def _theme_from_toml_lines(text):
+    """Pick `[theme] name` and `[theme.custom]` strings out of a config without
+    tomllib (Python < 3.11, e.g. the macOS system python3 that a launchd-started
+    herdr server finds on its minimal PATH). Only quoted string values are read,
+    which is all the theme tables hold."""
+    theme, section = {}, None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            section = line[1:line.find("]")].strip() if "]" in line else None
+            continue
+        m = re.match(r'([A-Za-z0-9_-]+)\s*=\s*"((?:[^"\\]|\\.)*)"', line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2)
+        if section == "theme":
+            theme[key] = val
+        elif section == "theme.custom":
+            theme.setdefault("custom", {})[key] = val
+    return theme
+
+
 def theme_palette():
     path = os.environ.get("HERDR_CONFIG_PATH") or os.path.expanduser(
         "~/.config/herdr/config.toml")
     name, custom = None, {}
     try:
-        import tomllib
-        with open(path, "rb") as f:
-            theme = tomllib.load(f).get("theme") or {}
+        try:
+            import tomllib
+        except ImportError:
+            tomllib = None
+        if tomllib:
+            with open(path, "rb") as f:
+                theme = tomllib.load(f).get("theme") or {}
+        else:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                theme = _theme_from_toml_lines(f.read())
         name = theme.get("name")
         custom = theme.get("custom") or {}
-    except (OSError, ValueError, ImportError):
+    except (OSError, ValueError):
         pass
     pal = dict(_PALETTES.get(name or "catppuccin") or _PALETTES["catppuccin"])
     for key, val in custom.items():
